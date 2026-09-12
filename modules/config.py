@@ -38,7 +38,7 @@ GROQ_API_KEY = raw_groq_key.strip().strip('"').strip("'").strip()
 MODELS = {
     "groq": {
         "stt": "whisper-large-v3",
-        "llm": "llama-3.3-70b-versatile"
+        "llm": "openai/gpt-oss-120b"
     },
     "offline": {
         "stt": "built-in-mock",

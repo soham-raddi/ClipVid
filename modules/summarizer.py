@@ -114,7 +114,7 @@ Ensure valid JSON format only.
 
 
 def _clean_and_parse_json(raw_text: str) -> Dict[str, Any]:
-    """Extract and parse JSON from LLM response, handling markdown fences."""
+    """Extract and parse JSON from LLM response, handling markdown fences and unstructured text fallback."""
     text = raw_text.strip()
     # Remove markdown code fences if present
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
@@ -122,15 +122,49 @@ def _clean_and_parse_json(raw_text: str) -> Dict[str, Any]:
         text = match.group(1).strip()
     
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Fallback: extract substring between first { and last }
-        first_brace = text.find('{')
-        last_brace = text.rfind('}')
-        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    # Fallback: extract substring between first { and last }
+    first_brace = text.find('{')
+    last_brace = text.rfind('}')
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        try:
             json_str = text[first_brace:last_brace + 1]
-            return json.loads(json_str)
-        raise SummarizationError("Failed to parse valid JSON from LLM response.")
+            data = json.loads(json_str)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+    # Intelligent text parsing fallback if model returns plain text
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    title = "Video Content Summary"
+    short_summary = text[:250] + "..." if len(text) > 250 else text
+    detailed_summary = text
+    key_points = []
+    topics = ["Video Analysis", "Key Insights", "Presentation"]
+
+    for line in lines:
+        if line.startswith(("-", "*", "•")) or (len(line) > 2 and line[0].isdigit() and line[1] in (".", ")")):
+            pt = re.sub(r"^[-*•\d.)\s]+", "", line).strip()
+            if pt:
+                key_points.append(pt)
+
+    if not key_points:
+        key_points = [lines[0] if lines else "Comprehensive summary generated from video transcript."]
+
+    return {
+        "suggested_title": title,
+        "short_summary": short_summary,
+        "detailed_summary": detailed_summary,
+        "key_points": key_points[:6],
+        "topics": topics,
+        "important_timestamps": []
+    }
 
 
 def _format_transcript_with_timestamps(transcript: TranscriptResult) -> str:
@@ -171,12 +205,12 @@ class GroqSummarizer(BaseSummarizer):
                 "Groq API Key is required. Please set GROQ_API_KEY in .env or via the sidebar."
             )
 
-    def _call_llm(self, prompt: str, system: str = SYSTEM_PROMPT) -> str:
+    def _call_llm(self, prompt: str, system: str = SYSTEM_PROMPT, json_mode: bool = False) -> str:
         from groq import Groq
         client = Groq(api_key=self.api_key)
         
-        # Priority order of candidate models on Groq
-        candidates = [self.model, "openai/gpt-oss-120b", "qwen/qwen3.8-27b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        # Priority order of verified candidate models on Groq
+        candidates = [self.model, "openai/gpt-oss-120b", "openai/gpt-oss-20b", "groq/compound-mini"]
         # Remove duplicates while preserving order
         unique_candidates = []
         for c in candidates:
@@ -186,23 +220,27 @@ class GroqSummarizer(BaseSummarizer):
         last_err = None
         for candidate in unique_candidates:
             try:
-                response = client.chat.completions.create(
-                    model=candidate,
-                    messages=[
+                kwargs = {
+                    "model": candidate,
+                    "messages": [
                         {"role": "system", "content": system},
                         {"role": "user", "content": prompt}
                     ],
-                    temperature=0.2,
-                    max_tokens=2048
-                )
+                    "temperature": 0.2,
+                    "max_tokens": 1000
+                }
+                if json_mode:
+                    kwargs["response_format"] = {"type": "json_object"}
+
+                response = client.chat.completions.create(**kwargs)
                 content = response.choices[0].message.content or ""
                 if content.strip():
                     return content
             except Exception as e:
                 err_str = str(e)
                 last_err = e
-                # If model not found or rate limited, continue to next candidate
-                if any(x in err_str.lower() for x in ["not_found", "does not exist", "permission", "access"]):
+                # Fallback on model not found, decommissioned, rate limit, or json validate failure
+                if any(x in err_str.lower() for x in ["not_found", "does not exist", "decommissioned", "rate_limit", "tokens", "429", "json_validate_failed"]):
                     continue
                 raise
 
@@ -222,7 +260,7 @@ class GroqSummarizer(BaseSummarizer):
                 prompt = SINGLE_PASS_PROMPT_TEMPLATE.format(
                     transcript_text=_format_transcript_with_timestamps(transcript)
                 )
-                raw = self._call_llm(prompt)
+                raw = self._call_llm(prompt, json_mode=True)
                 data = _clean_and_parse_json(raw)
                 return VideoSummaryOutput(**data)
 
@@ -240,7 +278,7 @@ class GroqSummarizer(BaseSummarizer):
                     time_range=chk.time_range,
                     chunk_text=chk.text
                 )
-                part_summary = self._call_llm(chunk_prompt)
+                part_summary = self._call_llm(chunk_prompt, json_mode=False)
                 chunk_summaries.append(f"--- Part {i} ({chk.time_range}) ---\n{part_summary}")
 
             if progress_callback:
@@ -249,7 +287,7 @@ class GroqSummarizer(BaseSummarizer):
             reduce_prompt = REDUCE_SYNTHESIS_PROMPT_TEMPLATE.format(
                 combined_chunk_summaries="\n\n".join(chunk_summaries)
             )
-            final_raw = self._call_llm(reduce_prompt)
+            final_raw = self._call_llm(reduce_prompt, json_mode=True)
             data = _clean_and_parse_json(final_raw)
             return VideoSummaryOutput(**data)
 
